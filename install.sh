@@ -8,12 +8,24 @@ clear
 
 [ $(id -u) != "0" ] && { echo "请使用ROOT用户进行安装, 输入sudo -i切换。"; exit 1; }
 
-if command -v systemctl &> /dev/null; then
-    echo "check systemctl..."
-    clear
+IS_OPENWRT=false
+
+# Check for OpenWrt
+if [ -f /etc/openwrt_version ]; then
+    IS_OPENWRT=true
+fi
+
+
+if [ "$IS_OPENWRT" = true ]; then
+    echo "This is an OpenWrt system."
 else
-    echo "当前系统不支持systemctl服务, 请先安装systemctl."
-    exit 1;
+    if command -v systemctl &> /dev/null; then
+        echo "check systemctl..."
+        clear
+    else
+        echo "当前系统不支持systemctl服务, 请先安装systemctl."
+        exit 1;
+    fi
 fi
 
 SERVICE_NAME="rmservice"
@@ -74,20 +86,71 @@ disable_firewall() {
 }
 
 check_process() {
-    if [[ $(uname) == "Linux" ]]; then
-        if pgrep -x "$1" >/dev/null; then
+    if [ "$IS_OPENWRT" = true ]; then
+        if pgrep -f "$1" >/dev/null; then
             return 0
         else
             return 1
         fi
     else
-        if ps aux | grep -v grep | grep "$1" >/dev/null; then
-            return 0
+        if [[ $(uname) == "Linux" ]]; then
+            if pgrep -x "$1" >/dev/null; then
+                return 0
+            else
+                return 1
+            fi
         else
-            return 1
+            if ps aux | grep -v grep | grep "$1" >/dev/null; then
+                return 0
+            else
+                return 1
+            fi
         fi
     fi
 }
+
+# openwrt设置开机启动
+#!/bin/sh
+
+# Function to set up auto-start and start the program
+wrt_enable_autostart() {
+    echo "wrt_set_start"
+    if [ ! -f /etc/init.d/rms ]; then
+        # Create an init script for the "rms" service
+        echo "#!/bin/sh /etc/rc.common" > /etc/init.d/rms
+        echo "USE_PROCD=1" >> /etc/init.d/rms
+        echo "START=99" >> /etc/init.d/rms
+        echo "start() {" >> /etc/init.d/rms
+        echo "    /root/rms/rms &" >> /etc/init.d/rms
+        echo "}" >> /etc/init.d/rms
+        
+        echo "PROG=/root/rms/rms" >> /etc/init.d/rms
+        echo "start_service(){" >> /etc/init.d/rms
+        echo "  procd_open_instance" >> /etc/init.d/rms
+        echo "  procd_set_param command \$PROG" >> /etc/init.d/rms
+        echo "  procd_set_param respawn" >> /etc/init.d/rms
+        echo "  procd_close_instance" >> /etc/init.d/rms
+        echo "}" >> /etc/init.d/rms
+
+        chmod +x /etc/init.d/rms
+    fi
+
+    /etc/init.d/rms enable
+    /etc/init.d/rms start
+}
+
+# Function to stop auto-start and stop the program
+wrt_disable_autostart() {
+    echo "wrt_set_disable"
+    if [ -f /etc/init.d/rms ]; then
+        # Stop the "rms" service
+        /etc/init.d/rms stop
+
+        # Remove the init script
+        rm /etc/init.d/rms
+    fi
+}
+
 
 # 设置开机启动且进程守护
 enable_autostart() {
@@ -135,27 +198,47 @@ disable_autostart() {
 }
 
 kill_process() {
-    local process_name="$1"
-  local pids=($(pgrep "$process_name"))
-  if [ ${#pids[@]} -eq 0 ]; then
-    echo "未发现 $process_name 进程."
-    return 1
-  fi
-  for pid in "${pids[@]}"; do
-    echo "Stopping process $pid ..."
-    kill -TERM "$pid"
-  done
-  echo "终止 $process_name ."
+    if [ "$IS_OPENWRT" = true ]; then
+        local process_name="$1"
+        local pids=($(pgrep -f "$process_name"))
+        echo "WRT KILL IPD $pids"
+        if kill -9 "$pids" >/dev/null 2>&1; then
+            echo "已终止 $pids 进程."
+        else
+            echo "未发现 $pids 进程."
+            return 1
+        fi
+    else
+        local process_name="$1"
+        local pids=($(pgrep "$process_name"))
+        
+        if [ ${#pids[@]} -eq 0 ]; then
+            echo "未发现 $process_name 进程."
+            return 1
+        fi
+        for pid in "${pids[@]}"; do
+            echo "Stopping process $pid ..."
+            kill -TERM "$pid"
+        done
+        echo "终止 $process_name ."
+    fi
 
-  sleep 1
+    sleep 1
 }
 
 install() {
-    chown root:root /mnt -R
-    chown root:root /etc -R
-    chown root:root /usr -R
-    chown man:root /var/cache/man -R
-    chmod g+s /var/cache/man -R
+    if [ -f /etc/centos-release ] || \
+    ([ -f /etc/lsb-release ] && . /etc/lsb-release && [ "$DISTRIB_ID" = "Ubuntu" ]) || \
+    [ -f /etc/openwrt_version ]; then
+        echo "CENTOS || UBUNTU || OPENWRT"
+    else
+        # 在其他操作系统上运行所需的命令
+        chown root:root /mnt -R
+        chown root:root /etc -R
+        chown root:root /usr -R
+        chown man:root /var/cache/man -R
+        chmod g+s /var/cache/man -R
+    fi
 
     disable_firewall
 
@@ -218,7 +301,11 @@ uninstall() {
 
     rm -rf ${PATH_RMS}
 
-    disable_autostart
+    if [ "$IS_OPENWRT" = true ]; then
+        wrt_disable_autostart
+    else
+        disable_autostart
+    fi
 
     echo "卸载成功"
 }
@@ -235,7 +322,11 @@ start() {
 
         # nohup "${PATH_RUST}/${PATH_EXEC}" 2>$PATH_ERR &
 
-        enable_autostart
+        if [ "$IS_OPENWRT" = true ]; then
+            wrt_enable_autostart
+        else
+            enable_autostart
+        fi
 
         sleep 1
 
@@ -254,7 +345,11 @@ start() {
 stop() {
     sleep 1
 
-    disable_autostart
+    if [ "$IS_OPENWRT" = true ]; then
+        wrt_disable_autostart
+    else
+        disable_autostart
+    fi
 
     sleep 1
 
